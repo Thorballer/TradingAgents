@@ -59,6 +59,26 @@ environment or `~/.hermes/.env`. It maps `GLM_API_KEY` → `ZHIPU_API_KEY`
 - Budget halts are fail-closed: over cap ⇒ no research, no orders.
 - Paper endpoint unless two independent switches are flipped.
 
+## The screener (one-shot picks)
+
+`TRADINGAGENTS_SCREENER=1` adds an algorithmic scanner ahead of the daily run.
+It's pure math (zero LLM tokens): pulls the S&P 500, computes 1-month momentum,
+trend alignment, and volume anomalies, vetoes earnings-window / penny / chaos
+names, and ranks the survivors.
+
+- Signals: `momentum_up`, `momentum_down`, `volume_spike` (2.5x average volume)
+- Top `TRADINGAGENTS_SCREENER_TOP_N` (default 2) fresh candidates per day get
+  the full AI research **once**. If the rating is directional, the trade is
+  placed — buy-once, never re-added.
+- Picks live on an episodic list (`autotrade_cli.py holds`): held until the
+  exchange-side stop fires, or until a **Monday Sell-check refresh** researches
+  them again and closes on a Sell/Underweight. Monday refreshes can only close,
+  never add.
+- Dedup is permanent (ledger): a ticker the screener already researched will
+  never be picked again. The recurring watchlist is never modified.
+- Preview picks without spending tokens: `python autotrade_cli.py scan`.
+- Weekends are skipped (scan data would be Friday-stale).
+
 ## Scheduling
 
 `com.dgold.tradingagents` LaunchAgent (see repo root) runs weekdays after the open

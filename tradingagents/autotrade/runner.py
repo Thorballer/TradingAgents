@@ -28,8 +28,36 @@ from .executor import AlpacaExecutor
 from .ledger import BudgetExceeded, TokenLedger
 from .notifier import default_notifier, make_alert_callback
 from .research_cache import ResearchCache, depth_fingerprint
+from .screener import STATE_DIR as SCREENER_STATE_DIR, ScreenerLedger, scan_universe
 
 DEFAULT_STATE_DIR = Path("~/.tradingagents/autotrade").expanduser()
+WEEKDAYS = {0, 1, 2, 3, 4}  # Mon-Fri: screener runs on trading days only
+EPISODIC_PATH = DEFAULT_STATE_DIR / "episodic_watchlist.json"
+
+
+def _load_episodic() -> list[str]:
+    """Symbols picked by the screener (researched once, held until stopped out)."""
+    if EPISODIC_PATH.exists():
+        try:
+            return json.loads(EPISODIC_PATH.read_text()).get("symbols", [])
+        except json.JSONDecodeError:
+            pass
+    return []
+
+
+def _remember_episodic(symbol: str) -> None:
+    symbols = _load_episodic()
+    if symbol not in symbols:
+        symbols.append(symbol)
+    EPISODIC_PATH.parent.mkdir(parents=True, exist_ok=True)
+    EPISODIC_PATH.write_text(json.dumps({"symbols": symbols}, indent=2))
+
+
+def _forget_episodic(symbol: str) -> None:
+    """Drop a symbol once it's been closed out (Sell rating, flat or filled)."""
+    symbols = [s for s in _load_episodic() if s != symbol]
+    EPISODIC_PATH.parent.mkdir(parents=True, exist_ok=True)
+    EPISODIC_PATH.write_text(json.dumps({"symbols": symbols}, indent=2))
 
 
 class AutoTradeRunner:
@@ -52,6 +80,10 @@ class AutoTradeRunner:
         self.fingerprint = depth_fingerprint(config)
         self.graph: TradingAgentsGraph | None = None
         self.handler: LedgerCallbackHandler | None = None
+        # Screener (set by from_env when enabled)
+        self.screener_enabled: bool = False
+        self.screener_top_n: int = 2
+        self.screener_ledger = ScreenerLedger()
 
     # ------------------------------------------------------------------ setup
 
@@ -67,6 +99,8 @@ class AutoTradeRunner:
         dry_run: bool = True,
         max_position_pct: float = 0.10,
         imsg_to: str | None = None,
+        screener: bool = False,
+        screener_top_n: int = 2,
     ) -> "AutoTradeRunner":
         cfg = DEFAULT_CONFIG.copy()
         cfg["llm_provider"] = os.environ.get("TRADINGAGENTS_LLM_PROVIDER", "glm")
@@ -100,7 +134,76 @@ class AutoTradeRunner:
             executor = AlpacaExecutor(
                 watchlist=watchlist, dry_run=dry_run, max_position_pct=max_position_pct
             )
-        return cls(cfg, ledger, cache, notifier, executor)
+        runner = cls(cfg, ledger, cache, notifier, executor)
+        if runner.executor is not None:
+            # Screener picks stay manageable across sessions (Sell ratings can
+            # close them) without joining the recurring watchlist.
+            runner.executor.watchlist |= set(_load_episodic())
+        runner.screener_enabled = screener
+        runner.screener_top_n = screener_top_n
+        runner.screener_ledger = ScreenerLedger()
+        return runner
+
+    # ------------------------------------------------------------- screener
+
+    def run_screener(self) -> list[dict]:
+        """Scan for movers and deep-research the top new candidates (once each).
+
+        Returns the list of candidate scan rows that were researched. A ticker
+        picked here never joins the recurring watchlist — it is researched,
+        traded if the rating is directional, and then held until its stop or a
+        future Sell rating on a manual re-run. Dedup is permanent (ledger) and
+        also respects the recurring watchlist. Weekends: scan data is stale
+        (Friday close), so automated scans skip them — use `scan` to preview.
+        """
+        if datetime.now().weekday() not in WEEKDAYS:
+            return []
+        try:
+            candidates = scan_universe(top_n=self.screener_top_n)
+        except Exception as e:
+            self.notifier.send(f"⚠️ Screener failed: {type(e).__name__}: {e}")
+            return []
+
+        recurring = {s.upper() for s in (self.executor.watchlist if self.executor else [])}
+        fresh = [
+            c for c in candidates
+            if c["ticker"] not in recurring and not self.screener_ledger.already_researched(c["ticker"])
+        ]
+
+        # Budget-gate BEFORE burning tokens: estimate a worst-case run (~300k)
+        # per candidate and stop admitting once the cap would be at risk.
+        results = []
+        for cand in fresh:
+            try:
+                self.ledger.check_budget(margin_tokens=300_000)
+            except BudgetExceeded:
+                self.notifier.send(
+                    f"🛑 Screener paused — token budget too low for a new research run "
+                    f"({self.ledger.usage()['used']:,}/{self.ledger.usage()['cap']:,})."
+                )
+                break
+            t = cand["ticker"]
+            # Make the pick tradable in this session BEFORE its run (research
+            # and execution happen inside self.run). Rolled back on failure.
+            if self.executor is not None:
+                self.executor.watchlist.add(t)
+            res = self.run(t, _from_screener=True)
+            ok = res.get("status") in ("researched", "cache_hit")
+            if ok:
+                _remember_episodic(t)
+                self.screener_ledger.mark(
+                    t,
+                    ",".join(cand["signals"]),
+                    {
+                        "research_signal": res.get("signal"),
+                        "close": cand["close"],
+                        "ret_1m": cand["ret_1m"],
+                        "vol_ratio": cand["vol_ratio"],
+                        "tokens_used": res.get("tokens_used", 0),
+                    },
+                )
+            results.append({**cand, "run": {k: res.get(k) for k in ("status", "signal", "tokens_used")}})
+        return results
 
     def _build_graph(self) -> tuple[TradingAgentsGraph, LedgerCallbackHandler]:
         """Build the graph with the ledger callback attached."""
@@ -114,9 +217,18 @@ class AutoTradeRunner:
 
     # ------------------------------------------------------------------- run
 
-    def run(self, ticker: str, trade_date: str | None = None) -> dict:
-        """Research one ticker and optionally execute. Returns a result dict."""
+    def run(self, ticker: str, trade_date: str | None = None,
+            allow_buy: bool = True, _from_screener: bool = False) -> dict:
+        """Research one ticker and optionally execute. Returns a result dict.
+
+        Episodic symbols (screener picks) are buy-once: only the screener run
+        that picked them may open a position; every later run is a Sell-check
+        that may close but never add.
+        """
         ticker = ticker.upper()
+        if (not _from_screener
+                and ticker in {s.upper() for s in _load_episodic()}):
+            allow_buy = False
         trade_date = trade_date or datetime.now().strftime("%Y-%m-%d")
         started = time.time()
         result: dict = {
@@ -192,8 +304,13 @@ class AutoTradeRunner:
             entry, stop = _parse_levels(result.get("trader_plan") or "")
             try:
                 result["execution"] = self.executor.execute_signal(
-                    ticker, signal, entry_price=entry, stop_loss=stop
+                    ticker, signal, entry_price=entry, stop_loss=stop,
+                    allow_buy=allow_buy,
                 )
+                # Episodic symbol closed out (or flat on a Sell) → forget it.
+                if (signal in ("Sell", "Underweight")
+                        and result["execution"].get("action") in ("none", "close")):
+                    _forget_episodic(ticker)
             except Exception as e:  # order rejections must not lose the research
                 result["execution"] = {"action": "error", "error": str(e)}
         else:

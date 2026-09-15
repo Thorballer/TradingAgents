@@ -110,7 +110,9 @@ class AlpacaExecutor:
             "type": "market",
             "time_in_force": "day",
             "order_class": "bracket",
-            "take_profit": {"limit_price": round(ref_price * 1.001, 2)},
+            # Stop-loss only, no take-profit leg: this system holds until the
+            # research rating (or the stop) says exit — a thin profit target
+            # would cap winners on day one.
         }
         if stop_price and 0 < stop_price < ref_price:
             order["stop_loss"] = {
@@ -142,9 +144,14 @@ class AlpacaExecutor:
     # -- rating dispatch ---------------------------------------------------------
 
     def execute_signal(self, symbol: str, signal: str, entry_price: float | None,
-                       stop_loss: float | None, current_price: float | None = None) -> dict:
-        """Map a 5-tier rating + trader levels onto an action. Idempotent-ish:
-        buying when already long is allowed (adds), selling without a position is a no-op."""
+                       stop_loss: float | None, current_price: float | None = None,
+                       allow_buy: bool = True) -> dict:
+        """Map a 5-tier rating + trader levels onto an action.
+
+        ``allow_buy=False`` (refresh/Sell-check runs) may only close, never add.
+        Idempotent-ish: buying when already long is allowed (adds), selling
+        without a position is a no-op.
+        """
         symbol = symbol.upper()
         if symbol not in self.watchlist:
             return {"action": "skipped", "reason": f"{symbol} not in watchlist"}
@@ -157,7 +164,10 @@ class AlpacaExecutor:
             res["signal"] = signal
             return res
 
-        if signal == "Buy" or signal == "Overweight":
+        if signal in ("Buy", "Overweight"):
+            if not allow_buy:
+                return {"action": "hold_no_add", "signal": signal,
+                        "reason": "refresh run: holds are Sell-check only, never adds"}
             ref = entry_price or current_price or self.last_price(symbol)
             stop = stop_loss if (stop_loss and stop_loss < ref) else None
             res = self.submit_bracket_buy(symbol, ref_price=ref, stop_price=stop)
