@@ -221,3 +221,9 @@ __marimo__/
 # Enterprise env file (secrets) and generated run reports
 .env.enterprise
 reports/
+
+.venv/
+logs/
+*.pyc
+__pycache__/
+.env.local
