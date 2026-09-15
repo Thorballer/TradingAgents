@@ -26,7 +26,7 @@ from tradingagents.graph.trading_graph import TradingAgentsGraph
 from .callbacks import LedgerCallbackHandler
 from .executor import AlpacaExecutor
 from .ledger import BudgetExceeded, TokenLedger
-from .notifier import ImsgNotifier, make_alert_callback
+from .notifier import default_notifier, make_alert_callback
 from .research_cache import ResearchCache, depth_fingerprint
 
 DEFAULT_STATE_DIR = Path("~/.tradingagents/autotrade").expanduser()
@@ -38,7 +38,7 @@ class AutoTradeRunner:
         config: dict,
         ledger: TokenLedger,
         cache: ResearchCache,
-        notifier: ImsgNotifier,
+        notifier,
         executor: AlpacaExecutor | None,
         results_dir: Path = DEFAULT_STATE_DIR / "runs",
     ):
@@ -88,7 +88,7 @@ class AutoTradeRunner:
             cfg["_selected_analysts"] = analysts
 
         state_dir = DEFAULT_STATE_DIR
-        notifier = ImsgNotifier(to=imsg_to or os.environ.get("TRADINGAGENTS_IMSG_TO", ""))
+        notifier = default_notifier(imsg_to=imsg_to)
         ledger = TokenLedger(
             state_path=state_dir / "ledger.json",
             weekly_cap_tokens=weekly_cap_tokens,
