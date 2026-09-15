@@ -156,6 +156,11 @@ class AutoTradeRunner:
                 result.update(status="halted_budget_midrun", error=str(e))
                 self._finish(result, notify=True)
                 return result
+            except Exception as e:
+                # Unattended runs must never fail silently (cron can't see a traceback).
+                result.update(status="error", error=f"{type(e).__name__}: {e}")
+                self._finish(result, notify=True)
+                return result
             tokens_used = self.ledger.usage()["used"] - before
             state = graph.curr_state
             result.update(
