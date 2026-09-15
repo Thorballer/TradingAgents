@@ -79,6 +79,14 @@ names, and ranks the survivors.
 - Preview picks without spending tokens: `python autotrade_cli.py scan`.
 - Weekends are skipped (scan data would be Friday-stale).
 
+## Market hours
+
+Runs only **start** weekdays 9:35am–2:45pm ET (checked in Eastern time). Outside
+the window every run exits immediately — zero tokens, no orders — so a manual
+or drifted schedule can't queue an order for the next open and double-fire.
+The executor *also* re-checks the session right before placing an order, in
+case research overruns. Manual override: `TRADINGAGENTS_IGNORE_MARKET_HOURS=1`.
+
 ## Scheduling
 
 `com.dgold.tradingagents` LaunchAgent (see repo root) runs weekdays after the open
