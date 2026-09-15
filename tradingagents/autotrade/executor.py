@@ -123,6 +123,14 @@ class AlpacaExecutor:
         if self.dry_run:
             return {"dry_run": True, "would_submit": order, "budget": budget, "equity": equity}
 
+        from .runner import market_phase  # late import avoids a cycle
+
+        if market_phase() != "open":
+            raise RuntimeError(
+                "order blocked: market closed (research overran the session; "
+                "a queued order could double-fire at the next open)"
+            )
+
         placed = self._req("POST", "/v2/orders", json=order)
         return {"dry_run": False, "order": placed}
 

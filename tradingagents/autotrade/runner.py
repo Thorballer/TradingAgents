@@ -17,8 +17,9 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, time as dtime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
@@ -32,6 +33,41 @@ from .screener import STATE_DIR as SCREENER_STATE_DIR, ScreenerLedger, scan_univ
 
 DEFAULT_STATE_DIR = Path("~/.tradingagents/autotrade").expanduser()
 WEEKDAYS = {0, 1, 2, 3, 4}  # Mon-Fri: screener runs on trading days only
+ET = ZoneInfo("America/New_York")
+
+# Research must START inside this window. Ends well before the close because
+# the order is placed AFTER research finishes (~25-40 min): a start after
+# ~14:45 could land its market order at/after the close, where it queues for
+# the next open — the exact double-buy trap this guard exists to prevent.
+RUN_WINDOW = (dtime(9, 35), dtime(14, 45))
+
+
+def market_hours_ignored() -> bool:
+    """Manual-override escape hatch (TRADINGAGENTS_IGNORE_MARKET_HOURS=1)."""
+    return os.environ.get("TRADINGAGENTS_IGNORE_MARKET_HOURS") == "1"
+
+
+def market_phase(now: datetime | None = None) -> str:
+    """US equity session phase in ET: 'pre' | 'open' | 'post' | 'closed'."""
+    now = now or datetime.now(ET)
+    if now.weekday() > 4:
+        return "closed"
+    t = now.time()
+    if dtime(9, 30) <= t < dtime(16, 0):
+        return "open"
+    if dtime(4, 0) <= t < dtime(9, 30):
+        return "pre"
+    if dtime(16, 0) <= t < dtime(20, 0):
+        return "post"
+    return "closed"
+
+
+def in_run_window(now: datetime | None = None) -> bool:
+    """True when a research+trade run may START (weekday, regular session)."""
+    now = now or datetime.now(ET)
+    return market_phase(now) == "open" and RUN_WINDOW[0] <= now.time() < RUN_WINDOW[1]
+
+
 EPISODIC_PATH = DEFAULT_STATE_DIR / "episodic_watchlist.json"
 
 
@@ -153,10 +189,10 @@ class AutoTradeRunner:
         picked here never joins the recurring watchlist — it is researched,
         traded if the rating is directional, and then held until its stop or a
         future Sell rating on a manual re-run. Dedup is permanent (ledger) and
-        also respects the recurring watchlist. Weekends: scan data is stale
-        (Friday close), so automated scans skip them — use `scan` to preview.
+        also respects the recurring watchlist. Weekends are skipped (scan data
+        would be stale) and scans only run during market hours.
         """
-        if datetime.now().weekday() not in WEEKDAYS:
+        if not in_run_window():
             return []
         try:
             candidates = scan_universe(top_n=self.screener_top_n)
@@ -223,9 +259,22 @@ class AutoTradeRunner:
 
         Episodic symbols (screener picks) are buy-once: only the screener run
         that picked them may open a position; every later run is a Sell-check
-        that may close but never add.
+        that may close but never add. Runs may only START inside the market
+        hours window (weekdays 9:35am–3:30pm ET) — never pre/after hours, so
+        orders can't queue for the next open and double-fire.
         """
         ticker = ticker.upper()
+        if not in_run_window() and not market_hours_ignored():
+            phase = market_phase()
+            result = {
+                "ticker": ticker,
+                "trade_date": trade_date or datetime.now().strftime("%Y-%m-%d"),
+                "status": "skipped_market_closed",
+                "phase": phase,
+                "note": f"runs start only weekdays 9:35am-2:45pm ET (now: {phase})",
+            }
+            self._finish(result, notify=False)
+            return result
         if (not _from_screener
                 and ticker in {s.upper() for s in _load_episodic()}):
             allow_buy = False

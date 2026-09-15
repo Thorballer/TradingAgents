@@ -153,13 +153,9 @@ def scan_universe(
             row["earnings_within_days"] = None
     still_in = [r for r in candidates if not any(v == "earnings" for v in _vetoes(r))]
 
-    # top N per signal family
-    def top(family: str) -> list[dict]:
-        rows = [r for r in still_in if family in r["signals"]]
-        rows.sort(key=lambda r: r["rank_score"], reverse=True)
-        return rows[:top_n]
-
-    selected = top("momentum_up") + top("momentum_down") + top("volume_spike")
+    # global top N across all signal families (user-facing cap: picks per day)
+    still_in.sort(key=lambda r: r["rank_score"], reverse=True)
+    selected = still_in[:top_n]
     seen, out = set(), []
     for r in selected:
         if r["ticker"] not in seen:
